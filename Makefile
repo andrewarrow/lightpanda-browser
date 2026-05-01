@@ -1,7 +1,10 @@
 # Variables
 # ---------
 
-ZIG := zig
+REQUIRED_ZIG_VERSION := $(shell sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)
+REQUIRED_ZIG_SERIES := $(shell printf '%s\n' '$(REQUIRED_ZIG_VERSION)' | cut -d. -f1,2)
+HOMEBREW_ZIG := $(shell if command -v brew >/dev/null 2>&1; then prefix=$$(brew --prefix zig@$(REQUIRED_ZIG_SERIES) 2>/dev/null); if [ -x "$$prefix/bin/zig" ]; then printf '%s/bin/zig' "$$prefix"; fi; fi)
+ZIG ?= $(if $(HOMEBREW_ZIG),$(HOMEBREW_ZIG),zig)
 BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
@@ -27,6 +30,12 @@ else
 	$(error "Unhandled kernel: $(kernel)")
 endif
 
+ifeq ($(OS), macos)
+# V8 hooks invoke `python3` directly. Prefer Apple's Python on macOS so a
+# broken Homebrew Python does not derail depot_tools during `gclient sync`.
+export PATH := /usr/bin:/bin:/usr/sbin:/sbin:$(PATH)
+endif
+
 
 # Infos
 # -----
@@ -47,10 +56,18 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-v8-snapshot build-dev run run-release test bench data end2end
+.PHONY: check-zig-version build build-v8-snapshot build-dev run run-release test bench data end2end
+
+check-zig-version:
+	@version="$$( $(ZIG) version 2>/dev/null || true )"; \
+	if [ "$$version" != "$(REQUIRED_ZIG_VERSION)" ]; then \
+		printf "\033[33mZig $(REQUIRED_ZIG_VERSION) is required; found %s using $(ZIG).\033[0m\n" "$${version:-not found}"; \
+		printf "Install the matching Zig version or run: make ZIG=/path/to/zig run\n"; \
+		exit 1; \
+	fi
 
 ## Build v8 snapshot
-build-v8-snapshot:
+build-v8-snapshot: check-zig-version
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
 	@$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
@@ -62,7 +79,7 @@ build: build-v8-snapshot
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
-build-dev:
+build-dev: check-zig-version
 	@printf "\033[36mBuilding (debug)...\033[0m\n"
 	@$(ZIG) build || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
@@ -79,11 +96,11 @@ run-debug: build-dev
 
 ## Test - `grep` is used to filter out the huge compile command on build
 ifeq ($(OS), macos)
-test:
+test: check-zig-version
 	@script -q /dev/null sh -c 'TEST_FILTER="${F}" $(ZIG) build test -freference-trace' 2>&1 \
 		| grep --line-buffered -v "^/.*zig test -freference-trace"
 else
-test:
+test: check-zig-version
 	@script -qec 'TEST_FILTER="${F}" $(ZIG) build test -freference-trace' /dev/null 2>&1 \
 		| grep --line-buffered -v "^/.*zig test -freference-trace"
 endif
