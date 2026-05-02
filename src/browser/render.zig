@@ -19,7 +19,6 @@
 const std = @import("std");
 
 const Frame = @import("Frame.zig");
-const CSS = @import("webapi/CSS.zig");
 const CData = @import("webapi/CData.zig");
 const Element = @import("webapi/Element.zig");
 const HTMLDocument = @import("webapi/HTMLDocument.zig");
@@ -37,6 +36,27 @@ pub const Options = struct {
 };
 
 const Pass = enum { measure, paint };
+
+const Display = enum { block, flex, grid, none };
+
+const Edges = struct {
+    top: i32 = 0,
+    right: i32 = 0,
+    bottom: i32 = 0,
+    left: i32 = 0,
+
+    fn all(value: i32) Edges {
+        return .{ .top = value, .right = value, .bottom = value, .left = value };
+    }
+
+    fn horizontal(self: Edges) i32 {
+        return self.left + self.right;
+    }
+
+    fn vertical(self: Edges) i32 {
+        return self.top + self.bottom;
+    }
+};
 
 const Rgba = struct {
     r: u8,
@@ -124,21 +144,37 @@ const Image = struct {
 };
 
 const ElementStyle = struct {
-    margin: i32,
-    padding: i32,
+    margin: Edges,
+    padding: Edges,
     width: i32,
     explicit_height: ?i32,
+    min_height: i32,
     color: Rgba,
     background: ?Rgba,
     font_scale: u8,
+    display: Display,
+    flex_column: bool,
+    center_auto: bool,
+    gap: i32,
+};
+
+const RawDeclaration = struct {
+    sheet_index: usize,
+    selector: []const u8,
+    name: []const u8,
+    value: []const u8,
 };
 
 const Renderer = struct {
     allocator: Allocator,
+    css_allocator: Allocator,
     frame: *Frame,
     image: *Image,
+    raw_style_texts: []?[]const u8 = &.{},
+    raw_declarations: []RawDeclaration = &.{},
 
     fn render(self: *Renderer) !void {
+        try self.loadRawStylesheetTexts();
         self.image.fill(.white);
 
         const root = self.renderRoot() orelse return;
@@ -159,6 +195,37 @@ const Renderer = struct {
         return self.frame.document.getDocumentElement();
     }
 
+    fn loadRawStylesheetTexts(self: *Renderer) !void {
+        const sheets = self.frame.document._style_sheets orelse return;
+        if (self.raw_style_texts.len == sheets._sheets.items.len) return;
+
+        self.raw_style_texts = try self.css_allocator.alloc(?[]const u8, sheets._sheets.items.len);
+        @memset(self.raw_style_texts, null);
+
+        var declarations: std.ArrayList(RawDeclaration) = .empty;
+        for (sheets._sheets.items, 0..) |sheet, i| {
+            if (sheet._css_rules != null) continue;
+            const owner = sheet.getOwnerNode() orelse continue;
+            if (owner.is(Element.Html.Style) == null) continue;
+            const text = owner.asNode().getTextContentAlloc(self.css_allocator) catch continue;
+            self.raw_style_texts[i] = text;
+
+            var rule_it = CssParser.parseStylesheet(text);
+            while (rule_it.next()) |rule| {
+                var decl_it = CssParser.parseDeclarationsList(rule.block);
+                while (decl_it.next()) |decl| {
+                    try declarations.append(self.css_allocator, .{
+                        .sheet_index = i,
+                        .selector = rule.selector,
+                        .name = decl.name,
+                        .value = decl.value,
+                    });
+                }
+            }
+        }
+        self.raw_declarations = try declarations.toOwnedSlice(self.css_allocator);
+    }
+
     fn layoutElement(
         self: *Renderer,
         pass: Pass,
@@ -173,16 +240,20 @@ const Renderer = struct {
 
         const max_width = @max(1, max_width_);
         const style = try self.elementStyle(el, max_width, inherited_color);
-        const outer_width = @max(1, @min(style.width, max_width - style.margin * 2));
-        const inner_width = @max(1, outer_width - style.padding * 2);
-        const outer_x = x + style.margin;
-        const outer_y = y + style.margin;
-        const inner_x = outer_x + style.padding;
-        var cursor_y = outer_y + style.padding;
+        if (style.display == .none) return 0;
+
+        const outer_width = @max(1, @min(style.width, max_width - style.margin.horizontal()));
+        const inner_width = @max(1, outer_width - style.padding.horizontal());
+        const extra_width = max_width - outer_width - style.margin.horizontal();
+        const auto_x = if (style.center_auto and extra_width > 0) @divTrunc(extra_width, 2) else 0;
+        const outer_x = x + style.margin.left + auto_x;
+        const outer_y = y + style.margin.top;
+        const inner_x = outer_x + style.padding.left;
+        var cursor_y = outer_y + style.padding.top;
 
         const measured_total_for_paint = if (pass == .paint) blk: {
             const measured = try self.layoutElement(.measure, el, x, y, max_width_, inherited_color, depth);
-            const measured_content_height = @max(0, measured - style.margin * 2);
+            const measured_content_height = @max(0, measured - style.margin.vertical());
             if (style.background) |bg| {
                 self.image.fillRect(outer_x, outer_y, outer_width, measured_content_height, bg);
             }
@@ -191,34 +262,83 @@ const Renderer = struct {
         } else null;
 
         var intrinsic_height = self.intrinsicHeight(el, style.font_scale);
-        var child = el.asNode().firstChild();
-        while (child) |node| {
-            switch (node._type) {
-                .cdata => |cd| {
-                    if (cd.is(CData.Text)) |_| {
-                        const h = self.layoutText(pass, cd.getData().str(), inner_x, cursor_y, inner_width, style.color, style.font_scale);
-                        cursor_y += h;
+        const row_children = self.rowChildCount(el, style);
+        if (row_children > 1) {
+            const gap_total = style.gap * @as(i32, @intCast(row_children - 1));
+            var flex_widths: [64]i32 = undefined;
+            var flex_width_count: usize = 0;
+            if (style.display == .flex) {
+                var width_child = el.asNode().firstChild();
+                while (width_child) |node| {
+                    switch (node._type) {
+                        .element => |child_el| {
+                            if (self.isRenderable(child_el) and flex_width_count < flex_widths.len) {
+                                flex_widths[flex_width_count] = try self.preferredFlexChildWidth(child_el, @max(1, inner_width - gap_total), style.color);
+                                flex_width_count += 1;
+                            }
+                        },
+                        else => {},
                     }
-                },
-                .element => |child_el| {
-                    const h = try self.layoutElement(pass, child_el, inner_x, cursor_y, inner_width, style.color, depth + 1);
-                    cursor_y += h;
-                },
-                else => {},
+                    width_child = node.nextSibling();
+                }
             }
-            child = node.nextSibling();
+
+            const grid_child_width = @max(1, @divTrunc(@max(1, inner_width - gap_total), @as(i32, @intCast(row_children))));
+            var cursor_x = inner_x;
+            var max_child_height: i32 = 0;
+            var child_index: usize = 0;
+
+            var child = el.asNode().firstChild();
+            while (child) |node| {
+                switch (node._type) {
+                    .element => |child_el| {
+                        if (self.isRenderable(child_el)) {
+                            const child_width = if (style.display == .flex and child_index < flex_width_count)
+                                @min(flex_widths[child_index], @max(1, inner_x + inner_width - cursor_x))
+                            else
+                                grid_child_width;
+                            const h = try self.layoutElement(pass, child_el, cursor_x, cursor_y, child_width, style.color, depth + 1);
+                            max_child_height = @max(max_child_height, h);
+                            cursor_x += child_width + style.gap;
+                            child_index += 1;
+                        }
+                    },
+                    else => {},
+                }
+                child = node.nextSibling();
+            }
+            cursor_y += max_child_height;
+        } else {
+            var child = el.asNode().firstChild();
+            while (child) |node| {
+                switch (node._type) {
+                    .cdata => |cd| {
+                        if (cd.is(CData.Text)) |_| {
+                            const h = self.layoutText(pass, cd.getData().str(), inner_x, cursor_y, inner_width, style.color, style.font_scale);
+                            cursor_y += h;
+                        }
+                    },
+                    .element => |child_el| {
+                        const h = try self.layoutElement(pass, child_el, inner_x, cursor_y, inner_width, style.color, depth + 1);
+                        cursor_y += h;
+                    },
+                    else => {},
+                }
+                child = node.nextSibling();
+            }
         }
 
-        if (intrinsic_height == 0 and cursor_y == outer_y + style.padding) {
+        if (intrinsic_height == 0 and cursor_y == outer_y + style.padding.top) {
             intrinsic_height = self.emptyElementHeight(el, style.font_scale);
         }
 
-        var content_height = cursor_y - outer_y + style.padding;
+        var content_height = cursor_y - outer_y + style.padding.bottom;
         content_height = @max(content_height, intrinsic_height);
         if (style.explicit_height) |h| {
             content_height = @max(content_height, h);
         }
-        const total_height = content_height + style.margin * 2;
+        content_height = @max(content_height, style.min_height);
+        const total_height = content_height + style.margin.vertical();
 
         if (pass == .paint) {
             return measured_total_for_paint.?;
@@ -229,22 +349,30 @@ const Renderer = struct {
 
     fn elementStyle(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba) !ElementStyle {
         const tag = el.getTag();
-        const margin = self.resolveLength(el, "margin") orelse defaultMargin(tag);
-        const padding = self.resolveLength(el, "padding") orelse defaultPadding(tag);
-        const explicit_width = self.resolveLength(el, "width") orelse self.attributeLength(el, "width");
-        const explicit_height = self.resolveLength(el, "height") orelse self.attributeLength(el, "height");
-        const width = explicit_width orelse defaultWidth(tag, max_width - margin * 2);
+        const inherited_font_scale = defaultFontScale(tag);
+        const margin = self.resolveEdges(el, "margin", defaultMargin(tag), max_width, inherited_font_scale);
+        const padding = self.resolveEdges(el, "padding", defaultPadding(tag), max_width, inherited_font_scale);
+        const available_width = @max(1, max_width - margin.horizontal());
+        const explicit_width = self.resolveLength(el, "width", available_width, inherited_font_scale) orelse self.attributeLength(el, "width", available_width);
+        const explicit_height = self.resolveLength(el, "height", available_width, inherited_font_scale) orelse self.attributeLength(el, "height", available_width);
+        const min_height = self.resolveLength(el, "min-height", available_width, inherited_font_scale) orelse 0;
+        const width = explicit_width orelse defaultWidth(tag, available_width);
         const color_value = self.resolveColor(el, "color") orelse inherited_color;
-        const font_scale = self.resolveFontScale(el) orelse defaultFontScale(tag);
+        const font_scale = self.resolveFontScale(el, inherited_font_scale) orelse inherited_font_scale;
 
         return .{
             .margin = margin,
             .padding = padding,
             .width = @max(1, width),
             .explicit_height = explicit_height,
+            .min_height = min_height,
             .color = color_value,
             .background = self.resolveColor(el, "background-color") orelse self.resolveColor(el, "background"),
             .font_scale = font_scale,
+            .display = self.resolveDisplay(el),
+            .flex_column = self.hasCssValue(el, "flex-direction", "column"),
+            .center_auto = self.hasAutoHorizontalMargin(el),
+            .gap = self.resolveLength(el, "gap", available_width, font_scale) orelse 0,
         };
     }
 
@@ -260,7 +388,7 @@ const Renderer = struct {
         return switch (el.getTag()) {
             .br => lineHeight(scale),
             .hr => 2,
-            .img, .iframe, .embed, .object, .video, .canvas, .svg => 120,
+            .img, .iframe, .embed, .object, .video, .canvas => 120,
             .input, .select, .textarea, .button => 34,
             else => 0,
         };
@@ -276,7 +404,7 @@ const Renderer = struct {
     fn paintIntrinsic(self: *Renderer, el: *Element, x: i32, y: i32, w: i32, h: i32, style: ElementStyle) !void {
         switch (el.getTag()) {
             .hr => self.image.fillRect(x, y + @divTrunc(h, 2), w, 1, .light_border),
-            .img, .iframe, .embed, .object, .video, .canvas, .svg => {
+            .img, .iframe, .embed, .object, .video, .canvas => {
                 self.image.fillRect(x, y, w, h, .surface);
                 self.image.strokeRect(x, y, w, h, .light_border);
                 const label = switch (el.getTag()) {
@@ -284,7 +412,6 @@ const Renderer = struct {
                     .iframe => "iframe",
                     .video => "video",
                     .canvas => "canvas",
-                    .svg => "svg",
                     else => "media",
                 };
                 _ = self.layoutText(.paint, label, x + 8, y + 8, @max(1, w - 16), .muted, 1);
@@ -295,8 +422,7 @@ const Renderer = struct {
                 if (el.getAttributeSafe(comptime .wrap("value")) orelse el.getAttributeSafe(comptime .wrap("placeholder"))) |label| {
                     _ = self.layoutText(.paint, label, x + 8, y + 10, @max(1, w - 16), style.color, 1);
                 } else {
-                    const text = el.asNode().getTextContentAlloc(self.allocator) catch null;
-                    defer if (text) |t| self.allocator.free(t);
+                    const text = el.asNode().getTextContentAlloc(self.css_allocator) catch null;
                     _ = self.layoutText(.paint, text orelse "", x + 8, y + 10, @max(1, w - 16), style.color, 1);
                 }
             },
@@ -313,34 +439,30 @@ const Renderer = struct {
         var cursor_x = x;
         var cursor_y = y;
         var drew = false;
-        var last_space = true;
 
-        for (text) |raw| {
-            const is_space = std.ascii.isWhitespace(raw);
-            if (is_space) {
-                if (!last_space) {
-                    if (cursor_x + glyph_advance > x + max_width) {
-                        cursor_x = x;
-                        cursor_y += lh;
-                    } else {
-                        cursor_x += glyph_advance;
-                    }
-                }
-                last_space = true;
-                continue;
-            }
-            last_space = false;
-
-            if (cursor_x + glyph_width > x + max_width) {
+        var word_it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        while (word_it.next()) |word| {
+            const word_width = @as(i32, @intCast(word.len)) * glyph_advance;
+            const needs_space = cursor_x > x;
+            const space_width = if (needs_space) glyph_advance else 0;
+            if (needs_space and cursor_x + space_width + word_width > x + max_width) {
                 cursor_x = x;
                 cursor_y += lh;
+            } else if (needs_space) {
+                cursor_x += glyph_advance;
             }
 
-            if (pass == .paint) {
-                self.drawGlyph(cursor_x, cursor_y, raw, c, scale);
+            for (word) |raw| {
+                if (cursor_x + glyph_width > x + max_width) {
+                    cursor_x = x;
+                    cursor_y += lh;
+                }
+                if (pass == .paint) {
+                    self.drawGlyph(cursor_x, cursor_y, raw, c, scale);
+                }
+                cursor_x += glyph_advance;
+                drew = true;
             }
-            cursor_x += glyph_advance;
-            drew = true;
         }
 
         return if (drew) cursor_y - y + lh else 0;
@@ -364,25 +486,115 @@ const Renderer = struct {
         }
     }
 
-    fn resolveLength(self: *Renderer, el: *Element, comptime property: []const u8) ?i32 {
-        const value = self.propertyValue(el, property) orelse return null;
-        return parseLength(value);
+    fn rowChildCount(self: *Renderer, el: *Element, style: ElementStyle) usize {
+        switch (style.display) {
+            .flex => {
+                if (style.flex_column) return 0;
+            },
+            .grid => {
+                const columns = self.propertyValue(el, "grid-template-columns") orelse return 0;
+                if (!looksMultiColumnGrid(columns)) return 0;
+            },
+            else => return 0,
+        }
+
+        var count: usize = 0;
+        var child = el.asNode().firstChild();
+        while (child) |node| {
+            switch (node._type) {
+                .element => |child_el| {
+                    if (self.isRenderable(child_el)) count += 1;
+                },
+                else => {},
+            }
+            child = node.nextSibling();
+        }
+        return count;
     }
 
-    fn resolveFontScale(self: *Renderer, el: *Element) ?u8 {
+    fn preferredFlexChildWidth(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba) !i32 {
+        const tag = el.getTag();
+        const font_scale = self.resolveFontScale(el, defaultFontScale(tag)) orelse defaultFontScale(tag);
+        const explicit_width = self.resolveLength(el, "width", max_width, font_scale) orelse self.attributeLength(el, "width", max_width);
+        if (explicit_width) |w| return @max(1, @min(max_width, w));
+
+        const child_style = try self.elementStyle(el, max_width, inherited_color);
+        const text = el.asNode().getTextContentAlloc(self.css_allocator) catch "";
+        const text_width = textInlineWidth(text, child_style.font_scale) + child_style.padding.horizontal();
+        if (text_width > child_style.padding.horizontal()) {
+            return @max(1, @min(max_width, text_width));
+        }
+        return @max(1, @min(max_width, child_style.width));
+    }
+
+    fn resolveLength(self: *Renderer, el: *Element, property: []const u8, percent_base: i32, font_scale: u8) ?i32 {
+        const value = self.propertyValue(el, property) orelse return null;
+        return parseLength(value, percent_base, @intCast(self.image.width), @intCast(self.image.height), font_scale);
+    }
+
+    fn resolveEdges(self: *Renderer, el: *Element, property: []const u8, default_value: i32, percent_base: i32, font_scale: u8) Edges {
+        var edges = Edges.all(default_value);
+        if (self.propertyValue(el, property)) |value| {
+            edges = parseEdges(value, percent_base, @intCast(self.image.width), @intCast(self.image.height), font_scale) orelse edges;
+        }
+
+        if (std.mem.eql(u8, property, "margin")) {
+            edges.top = self.resolveLength(el, "margin-top", percent_base, font_scale) orelse edges.top;
+            edges.right = self.resolveLength(el, "margin-right", percent_base, font_scale) orelse edges.right;
+            edges.bottom = self.resolveLength(el, "margin-bottom", percent_base, font_scale) orelse edges.bottom;
+            edges.left = self.resolveLength(el, "margin-left", percent_base, font_scale) orelse edges.left;
+        } else {
+            edges.top = self.resolveLength(el, "padding-top", percent_base, font_scale) orelse edges.top;
+            edges.right = self.resolveLength(el, "padding-right", percent_base, font_scale) orelse edges.right;
+            edges.bottom = self.resolveLength(el, "padding-bottom", percent_base, font_scale) orelse edges.bottom;
+            edges.left = self.resolveLength(el, "padding-left", percent_base, font_scale) orelse edges.left;
+        }
+        return edges;
+    }
+
+    fn resolveFontScale(self: *Renderer, el: *Element, inherited_scale: u8) ?u8 {
         const value = self.propertyValue(el, "font-size") orelse return null;
-        const px = parseLength(value) orelse return null;
-        if (px >= 30) return 3;
-        if (px >= 18) return 2;
-        return 1;
+        const px = parseLength(value, @intCast(self.image.width), @intCast(self.image.width), @intCast(self.image.height), inherited_scale) orelse return null;
+        const scale = std.math.clamp(@divTrunc(px + 5, 11), 1, 10);
+        return @intCast(scale);
     }
 
-    fn resolveColor(self: *Renderer, el: *Element, comptime property: []const u8) ?Rgba {
+    fn resolveColor(self: *Renderer, el: *Element, property: []const u8) ?Rgba {
         const value = self.propertyValue(el, property) orelse return null;
+        return self.parseCssColorValue(value);
+    }
+
+    fn parseCssColorValue(self: *Renderer, value: []const u8) ?Rgba {
+        if (lastCssVariableName(value)) |name| {
+            if (self.variableValue(name)) |var_value| {
+                if (parseCssColor(var_value)) |rgba| return rgba;
+            }
+        }
         return parseCssColor(value);
     }
 
-    fn propertyValue(self: *Renderer, el: *Element, comptime property: []const u8) ?[]const u8 {
+    fn resolveDisplay(self: *Renderer, el: *Element) Display {
+        const value = self.propertyValue(el, "display") orelse return .block;
+        if (containsCssIdent(value, "none")) return .none;
+        if (containsCssIdent(value, "flex") or containsCssIdent(value, "inline-flex")) return .flex;
+        if (containsCssIdent(value, "grid") or containsCssIdent(value, "inline-grid")) return .grid;
+        return .block;
+    }
+
+    fn hasCssValue(self: *Renderer, el: *Element, property: []const u8, needle: []const u8) bool {
+        const value = self.propertyValue(el, property) orelse return false;
+        return containsCssIdent(value, needle);
+    }
+
+    fn hasAutoHorizontalMargin(self: *Renderer, el: *Element) bool {
+        if (self.hasCssValue(el, "margin-left", "auto") or self.hasCssValue(el, "margin-right", "auto")) {
+            return true;
+        }
+        const value = self.propertyValue(el, "margin") orelse return false;
+        return containsCssIdent(value, "auto");
+    }
+
+    fn propertyValue(self: *Renderer, el: *Element, property: []const u8) ?[]const u8 {
         var value = self.stylesheetProperty(el, property);
 
         const style = el.getOrCreateStyle(self.frame) catch return value;
@@ -393,11 +605,11 @@ const Renderer = struct {
         return value;
     }
 
-    fn stylesheetProperty(self: *Renderer, el: *Element, comptime property: []const u8) ?[]const u8 {
+    fn stylesheetProperty(self: *Renderer, el: *Element, property: []const u8) ?[]const u8 {
         const sheets = self.frame.document._style_sheets orelse return null;
         var value: ?[]const u8 = null;
 
-        for (sheets._sheets.items) |sheet| {
+        for (sheets._sheets.items, 0..) |sheet, sheet_i| {
             if (sheet._css_rules) |rules| {
                 for (rules._rules.items) |rule| {
                     const style_rule = rule.is(CSSStyleRule) orelse continue;
@@ -409,31 +621,55 @@ const Renderer = struct {
                 continue;
             }
 
-            const owner = sheet.getOwnerNode() orelse continue;
-            if (owner.is(Element.Html.Style) == null) continue;
-            const text = owner.asNode().getTextContentAlloc(self.allocator) catch continue;
-            defer self.allocator.free(text);
-
-            var rule_it = CssParser.parseStylesheet(text);
-            while (rule_it.next()) |rule| {
-                if (!(Selector.matches(el, rule.selector, self.frame) catch false)) continue;
-                var decl_it = CssParser.parseDeclarationsList(rule.block);
-                while (decl_it.next()) |decl| {
-                    if (std.ascii.eqlIgnoreCase(decl.name, property)) {
-                        value = decl.value;
-                    }
-                }
+            for (self.raw_declarations) |decl| {
+                if (decl.sheet_index != sheet_i) continue;
+                if (!std.ascii.eqlIgnoreCase(decl.name, property)) continue;
+                if (!(Selector.matches(el, decl.selector, self.frame) catch false)) continue;
+                value = decl.value;
             }
         }
         return value;
     }
 
-    fn attributeLength(_: *Renderer, el: *Element, comptime attr: []const u8) ?i32 {
+    fn variableValue(self: *Renderer, name: []const u8) ?[]const u8 {
+        const sheets = self.frame.document._style_sheets orelse return null;
+        var value: ?[]const u8 = null;
+
+        for (self.raw_style_texts) |maybe_text| {
+            const text = maybe_text orelse continue;
+            if (findRootCustomProperty(text, name)) |raw_value| {
+                value = raw_value;
+            }
+        }
+
+        for (sheets._sheets.items, 0..) |sheet, sheet_i| {
+            if (sheet._css_rules) |rules| {
+                for (rules._rules.items) |rule| {
+                    const style_rule = rule.is(CSSStyleRule) orelse continue;
+                    if (!selectorCanDefineRootVars(style_rule.getSelectorText())) continue;
+                    const style = style_rule._style orelse continue;
+                    const next = style.asCSSStyleDeclaration().getPropertyValue(name, self.frame);
+                    if (next.len > 0) value = next;
+                }
+                continue;
+            }
+
+            for (self.raw_declarations) |decl| {
+                if (decl.sheet_index != sheet_i) continue;
+                if (!std.ascii.eqlIgnoreCase(decl.name, name)) continue;
+                if (!selectorCanDefineRootVars(decl.selector)) continue;
+                value = decl.value;
+            }
+        }
+        return value;
+    }
+
+    fn attributeLength(self: *Renderer, el: *Element, comptime attr: []const u8, percent_base: i32) ?i32 {
         const value = if (std.mem.eql(u8, attr, "width"))
             el.getAttributeSafe(comptime .wrap("width"))
         else
             el.getAttributeSafe(comptime .wrap("height"));
-        return parseLength(value orelse return null);
+        return parseLength(value orelse return null, percent_base, @intCast(self.image.width), @intCast(self.image.height), 2);
     }
 };
 
@@ -441,8 +677,12 @@ pub fn writePngFile(allocator: Allocator, frame: *Frame, path: []const u8, opts:
     var image = try Image.init(allocator, opts.width, opts.height);
     defer image.deinit(allocator);
 
+    var css_arena = std.heap.ArenaAllocator.init(allocator);
+    defer css_arena.deinit();
+
     var renderer = Renderer{
         .allocator = allocator,
+        .css_allocator = css_arena.allocator(),
         .frame = frame,
         .image = &image,
     };
@@ -476,7 +716,7 @@ fn defaultPadding(tag: Element.Tag) i32 {
 
 fn defaultWidth(tag: Element.Tag, max_width: i32) i32 {
     return switch (tag) {
-        .img, .iframe, .embed, .object, .video, .canvas, .svg => @min(max_width, 320),
+        .img, .iframe, .embed, .object, .video, .canvas => @min(max_width, 320),
         .input, .select, .textarea => @min(max_width, 240),
         .button => @min(max_width, 180),
         else => max_width,
@@ -485,9 +725,9 @@ fn defaultWidth(tag: Element.Tag, max_width: i32) i32 {
 
 fn defaultFontScale(tag: Element.Tag) u8 {
     return switch (tag) {
-        .h1 => 3,
-        .h2, .h3 => 2,
-        else => 1,
+        .h1 => 6,
+        .h2, .h3 => 4,
+        else => 2,
     };
 }
 
@@ -495,20 +735,301 @@ fn lineHeight(scale: u8) i32 {
     return @as(i32, scale) * 9 + 4;
 }
 
-fn parseLength(value_: []const u8) ?i32 {
-    const value = std.mem.trim(u8, value_, " \t\r\n;");
+fn textInlineWidth(text: []const u8, scale: u8) i32 {
+    const glyph_advance: i32 = @as(i32, scale) * 6;
+    var width: i32 = 0;
+    var needs_space = false;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (it.next()) |word| {
+        if (needs_space) width += glyph_advance;
+        width += @as(i32, @intCast(word.len)) * glyph_advance;
+        needs_space = true;
+    }
+    return width;
+}
+
+fn fontScalePx(scale: u8) f64 {
+    return @as(f64, @floatFromInt(@max(@as(u8, 1), scale))) * 8.0;
+}
+
+fn stripImportant(value: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, value, "!important")) |pos| {
+        return std.mem.trim(u8, value[0..pos], " \t\r\n;");
+    }
+    return value;
+}
+
+fn stripFunction(value: []const u8, name: []const u8) ?[]const u8 {
+    if (!std.ascii.startsWithIgnoreCase(value, name)) return null;
+    var pos = name.len;
+    while (pos < value.len and std.ascii.isWhitespace(value[pos])) : (pos += 1) {}
+    if (pos >= value.len or value[pos] != '(') return null;
+    const close = std.mem.lastIndexOfScalar(u8, value, ')') orelse return null;
+    if (close <= pos) return null;
+    return std.mem.trim(u8, value[pos + 1 .. close], " \t\r\n");
+}
+
+fn splitCssArgs(value: []const u8, out: [][]const u8) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    var depth: u16 = 0;
+    for (value, 0..) |c, i| {
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                if (count < out.len) {
+                    out[count] = std.mem.trim(u8, value[start..i], " \t\r\n");
+                    count += 1;
+                }
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    if (count < out.len) {
+        out[count] = std.mem.trim(u8, value[start..], " \t\r\n");
+        count += 1;
+    }
+    return count;
+}
+
+fn splitCssComponents(value: []const u8, out: [][]const u8) usize {
+    var count: usize = 0;
+    var start: ?usize = null;
+    var depth: u16 = 0;
+    for (value, 0..) |c, i| {
+        if (start == null and !std.ascii.isWhitespace(c)) start = i;
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and std.ascii.isWhitespace(c)) {
+            if (start) |s| {
+                if (s < i and count < out.len) {
+                    out[count] = value[s..i];
+                    count += 1;
+                }
+            }
+            start = null;
+        }
+    }
+    if (start) |s| {
+        if (s < value.len and count < out.len) {
+            out[count] = value[s..];
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn topLevelOperator(value: []const u8, op: u8) ?usize {
+    var depth: u16 = 0;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        switch (c) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0 or c != op or i == 0) continue;
+        const prev = value[i - 1];
+        if ((prev == 'e' or prev == 'E') and i + 1 < value.len and (std.ascii.isDigit(value[i + 1]) or value[i + 1] == '.')) continue;
+        return i;
+    }
+    return null;
+}
+
+fn looksMultiColumnGrid(value_: []const u8) bool {
+    const value = stripImportant(std.mem.trim(u8, value_, " \t\r\n;"));
+    if (containsCssIdent(value, "none") or value.len == 0) return false;
+    if (std.ascii.indexOfIgnoreCase(value, "repeat(") != null) return true;
+
+    var parts: [4][]const u8 = undefined;
+    return splitCssComponents(value, &parts) > 1;
+}
+
+fn containsCssIdent(value_: []const u8, needle: []const u8) bool {
+    const value = stripImportant(std.mem.trim(u8, value_, " \t\r\n;"));
+    var it = std.mem.tokenizeAny(u8, value, " \t\r\n,;/()");
+    while (it.next()) |token| {
+        if (std.ascii.eqlIgnoreCase(token, needle)) return true;
+    }
+    return false;
+}
+
+fn lastCssVariableName(value: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    var pos: usize = 0;
+    while (pos < value.len) {
+        const rel_start = std.ascii.indexOfIgnoreCase(value[pos..], "var(") orelse break;
+        const start = pos + rel_start;
+        var name_start = start + 4;
+        while (name_start < value.len and std.ascii.isWhitespace(value[name_start])) : (name_start += 1) {}
+
+        var end = name_start;
+        while (end < value.len and value[end] != ')' and value[end] != ',' and !std.ascii.isWhitespace(value[end])) : (end += 1) {}
+        if (end > name_start) result = value[name_start..end];
+        pos = start + 4;
+    }
+    return result;
+}
+
+fn findRootCustomProperty(text: []const u8, name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, ":root")) |root_pos| {
+        const open = std.mem.indexOfScalarPos(u8, text, root_pos, '{') orelse return null;
+        const close = std.mem.indexOfScalarPos(u8, text, open + 1, '}') orelse return null;
+        if (findDeclarationInBlock(text[open + 1 .. close], name)) |value| return value;
+        pos = close + 1;
+    }
+    return null;
+}
+
+fn findDeclarationInBlock(block: []const u8, name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, block, pos, name)) |name_pos| {
+        const after_name = name_pos + name.len;
+        var colon = after_name;
+        while (colon < block.len and std.ascii.isWhitespace(block[colon])) : (colon += 1) {}
+        if (colon < block.len and block[colon] == ':') {
+            var value_start = colon + 1;
+            while (value_start < block.len and std.ascii.isWhitespace(block[value_start])) : (value_start += 1) {}
+
+            var value_end = value_start;
+            while (value_end < block.len and block[value_end] != ';') : (value_end += 1) {}
+            return std.mem.trim(u8, block[value_start..value_end], " \t\r\n");
+        }
+        pos = after_name;
+    }
+    return null;
+}
+
+fn selectorCanDefineRootVars(selector_: []const u8) bool {
+    const selector = std.mem.trim(u8, selector_, " \t\r\n");
+    return std.mem.indexOf(u8, selector, ":root") != null or
+        std.mem.eql(u8, selector, "html") or
+        std.mem.startsWith(u8, selector, "html,") or
+        std.mem.endsWith(u8, selector, ",html");
+}
+
+fn parseEdges(value_: []const u8, percent_base: i32, viewport_width: i32, viewport_height: i32, font_scale: u8) ?Edges {
+    const value = stripImportant(std.mem.trim(u8, value_, " \t\r\n;"));
     if (value.len == 0) return null;
 
+    var parts: [4][]const u8 = undefined;
+    const count = splitCssComponents(value, &parts);
+    if (count == 0) return null;
+
+    var lengths: [4]i32 = .{ 0, 0, 0, 0 };
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        lengths[i] = parseLength(parts[i], percent_base, viewport_width, viewport_height, font_scale) orelse 0;
+    }
+
+    return switch (count) {
+        1 => Edges.all(lengths[0]),
+        2 => .{ .top = lengths[0], .right = lengths[1], .bottom = lengths[0], .left = lengths[1] },
+        3 => .{ .top = lengths[0], .right = lengths[1], .bottom = lengths[2], .left = lengths[1] },
+        else => .{ .top = lengths[0], .right = lengths[1], .bottom = lengths[2], .left = lengths[3] },
+    };
+}
+
+fn parseLength(value_: []const u8, percent_base: i32, viewport_width: i32, viewport_height: i32, font_scale: u8) ?i32 {
+    const value = stripImportant(std.mem.trim(u8, value_, " \t\r\n;"));
+    if (value.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(value, "auto") or
+        std.ascii.eqlIgnoreCase(value, "none") or
+        std.ascii.eqlIgnoreCase(value, "normal"))
+    {
+        return null;
+    }
+
+    if (stripFunction(value, "calc")) |inner| {
+        return parseLength(inner, percent_base, viewport_width, viewport_height, font_scale);
+    }
+    if (stripFunction(value, "min")) |inner| {
+        var args: [8][]const u8 = undefined;
+        const count = splitCssArgs(inner, &args);
+        if (count == 0) return null;
+
+        var result: ?i32 = null;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const next = parseLength(args[i], percent_base, viewport_width, viewport_height, font_scale) orelse continue;
+            result = if (result) |current| @min(current, next) else next;
+        }
+        return result;
+    }
+    if (stripFunction(value, "max")) |inner| {
+        var args: [8][]const u8 = undefined;
+        const count = splitCssArgs(inner, &args);
+        if (count == 0) return null;
+
+        var result: ?i32 = null;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const next = parseLength(args[i], percent_base, viewport_width, viewport_height, font_scale) orelse continue;
+            result = if (result) |current| @max(current, next) else next;
+        }
+        return result;
+    }
+    if (stripFunction(value, "clamp")) |inner| {
+        var args: [3][]const u8 = undefined;
+        const count = splitCssArgs(inner, &args);
+        if (count != 3) return null;
+
+        const lo = parseLength(args[0], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        const mid = parseLength(args[1], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        const hi = parseLength(args[2], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        return std.math.clamp(mid, lo, hi);
+    }
+
+    if (topLevelOperator(value, '+')) |pos| {
+        const left = parseLength(value[0..pos], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        const right = parseLength(value[pos + 1 ..], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        return left + right;
+    }
+    if (topLevelOperator(value, '-')) |pos| {
+        const left = parseLength(value[0..pos], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        const right = parseLength(value[pos + 1 ..], percent_base, viewport_width, viewport_height, font_scale) orelse return null;
+        return left - right;
+    }
+
     var end: usize = 0;
+    if (end < value.len and (value[end] == '-' or value[end] == '+')) end += 1;
     while (end < value.len) : (end += 1) {
         const c = value[end];
-        if (!(std.ascii.isDigit(c) or c == '.' or c == '-')) break;
+        if (!(std.ascii.isDigit(c) or c == '.')) break;
     }
-    if (end == 0) return null;
+    if (end == 0 or (end == 1 and (value[0] == '-' or value[0] == '+'))) return null;
 
-    const n = CSS.parseDimension(value[0..end]) orelse return null;
-    if (n <= 0) return null;
-    return @intFromFloat(@min(n, 100_000));
+    const n = std.fmt.parseFloat(f64, value[0..end]) catch return null;
+    const unit = std.mem.trim(u8, value[end..], " \t\r\n");
+    const px = if (unit.len == 0 or std.mem.startsWith(u8, unit, "px"))
+        n
+    else if (std.mem.startsWith(u8, unit, "rem"))
+        n * 16.0
+    else if (std.mem.startsWith(u8, unit, "em"))
+        n * fontScalePx(font_scale)
+    else if (std.mem.startsWith(u8, unit, "%"))
+        n * @as(f64, @floatFromInt(percent_base)) / 100.0
+    else if (std.mem.startsWith(u8, unit, "vw"))
+        n * @as(f64, @floatFromInt(viewport_width)) / 100.0
+    else if (std.mem.startsWith(u8, unit, "vh") or std.mem.startsWith(u8, unit, "dvh") or std.mem.startsWith(u8, unit, "svh") or std.mem.startsWith(u8, unit, "lvh"))
+        n * @as(f64, @floatFromInt(viewport_height)) / 100.0
+    else
+        n;
+
+    return @intFromFloat(std.math.clamp(@round(px), -100_000.0, 100_000.0));
 }
 
 fn parseCssColor(value_: []const u8) ?Rgba {
@@ -718,6 +1239,8 @@ fn glyph(raw: u8) [7]u8 {
         ')' => .{ 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 },
         '[' => .{ 0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e },
         ']' => .{ 0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e },
+        '{' => .{ 0x02, 0x04, 0x04, 0x18, 0x04, 0x04, 0x02 },
+        '}' => .{ 0x08, 0x04, 0x04, 0x03, 0x04, 0x04, 0x08 },
         '+' => .{ 0, 0x04, 0x04, 0x1f, 0x04, 0x04, 0 },
         '=' => .{ 0, 0, 0x1f, 0, 0x1f, 0, 0 },
         '*' => .{ 0, 0x15, 0x0e, 0x1f, 0x0e, 0x15, 0 },
