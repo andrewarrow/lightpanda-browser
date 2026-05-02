@@ -39,20 +39,20 @@ endif
 
 define run_with_heartbeat
 	@start=$$(date +%s); \
-	$(1) & build_pid=$$!; \
 	( \
-		while kill -0 $$build_pid 2>/dev/null; do \
+		while true; do \
 			sleep $(BUILD_HEARTBEAT_SECONDS); \
-			kill -0 $$build_pid 2>/dev/null || break; \
 			now=$$(date +%s); \
 			elapsed=$$((now - start)); \
 			printf "\033[36mStill building (%ss elapsed)...\033[0m\n" "$$elapsed"; \
 		done \
 	) & heartbeat_pid=$$!; \
-	trap 'kill $$build_pid $$heartbeat_pid 2>/dev/null || true' INT TERM EXIT; \
-	wait $$build_pid; status=$$?; \
-	kill $$heartbeat_pid 2>/dev/null || true; \
-	wait $$heartbeat_pid 2>/dev/null || true; \
+	trap 'kill "$$heartbeat_pid" 2>/dev/null || true; exit 130' INT; \
+	trap 'kill "$$heartbeat_pid" 2>/dev/null || true; exit 143' TERM; \
+	trap 'kill "$$heartbeat_pid" 2>/dev/null || true' EXIT; \
+	$(1); status=$$?; \
+	kill "$$heartbeat_pid" 2>/dev/null || true; \
+	wait "$$heartbeat_pid" 2>/dev/null || true; \
 	trap - INT TERM EXIT; \
 	if [ $$status -ne 0 ]; then \
 		printf "\033[33mBuild ERROR\033[0m\n"; \

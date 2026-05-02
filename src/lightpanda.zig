@@ -35,7 +35,6 @@ pub const Session = @import("browser/Session.zig");
 pub const js = @import("browser/js/js.zig");
 pub const dump = @import("browser/dump.zig");
 pub const markdown = @import("browser/markdown.zig");
-pub const render = @import("browser/render.zig");
 pub const SemanticTree = @import("SemanticTree.zig");
 pub const CDPNode = @import("cdp/Node.zig");
 pub const interactive = @import("browser/interactive.zig");
@@ -152,6 +151,7 @@ pub fn fetch(app: *App, browser: *Browser, url: [:0]const u8, opts: FetchOpts) !
     }
 
     if (opts.make_png) |path| {
+        const render = @import("browser/render.zig");
         try render.writePngFile(app.allocator, frame, path, .{});
     }
 
