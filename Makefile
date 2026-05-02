@@ -8,6 +8,7 @@ ZIG ?= $(if $(HOMEBREW_ZIG),$(HOMEBREW_ZIG),zig)
 BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
+BUILD_HEARTBEAT_SECONDS ?= 30
 
 # OS and ARCH
 kernel = $(shell uname -ms)
@@ -35,6 +36,29 @@ ifeq ($(OS), macos)
 # broken Homebrew Python does not derail depot_tools during `gclient sync`.
 export PATH := /usr/bin:/bin:/usr/sbin:/sbin:$(PATH)
 endif
+
+define run_with_heartbeat
+	@start=$$(date +%s); \
+	$(1) & build_pid=$$!; \
+	( \
+		while kill -0 $$build_pid 2>/dev/null; do \
+			sleep $(BUILD_HEARTBEAT_SECONDS); \
+			kill -0 $$build_pid 2>/dev/null || break; \
+			now=$$(date +%s); \
+			elapsed=$$((now - start)); \
+			printf "\033[36mStill building (%ss elapsed)...\033[0m\n" "$$elapsed"; \
+		done \
+	) & heartbeat_pid=$$!; \
+	trap 'kill $$build_pid $$heartbeat_pid 2>/dev/null || true' INT TERM EXIT; \
+	wait $$build_pid; status=$$?; \
+	kill $$heartbeat_pid 2>/dev/null || true; \
+	wait $$heartbeat_pid 2>/dev/null || true; \
+	trap - INT TERM EXIT; \
+	if [ $$status -ne 0 ]; then \
+		printf "\033[33mBuild ERROR\033[0m\n"; \
+		exit $$status; \
+	fi
+endef
 
 
 # Infos
@@ -69,19 +93,19 @@ check-zig-version:
 ## Build v8 snapshot
 build-v8-snapshot: check-zig-version
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	@$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
 build: build-v8-snapshot
 	@printf "\033[36mBuilding (release fast)...\033[0m\n"
-	@$(ZIG) build -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
 build-dev: check-zig-version
 	@printf "\033[36mBuilding (debug)...\033[0m\n"
-	@$(ZIG) build || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	$(call run_with_heartbeat,$(ZIG) build)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Run the server in release mode
