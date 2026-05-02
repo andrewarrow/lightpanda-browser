@@ -308,6 +308,8 @@ pub fn Builder(comptime commands: anytype) type {
             // Fetch heuristics.
             inline for (.{
                 "--dump",
+                "--make-png",
+                "--make_png",
                 "--strip-mode",
                 "--strip_mode",
                 "--with-base",

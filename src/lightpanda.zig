@@ -35,6 +35,7 @@ pub const Session = @import("browser/Session.zig");
 pub const js = @import("browser/js/js.zig");
 pub const dump = @import("browser/dump.zig");
 pub const markdown = @import("browser/markdown.zig");
+pub const render = @import("browser/render.zig");
 pub const SemanticTree = @import("SemanticTree.zig");
 pub const CDPNode = @import("cdp/Node.zig");
 pub const interactive = @import("browser/interactive.zig");
@@ -58,6 +59,7 @@ pub const FetchOpts = struct {
     wait_selector: ?[:0]const u8 = null,
     dump: dump.Opts,
     dump_mode: ?Config.DumpFormat = null,
+    make_png: ?[]const u8 = null,
     writer: ?*std.Io.Writer = null,
 };
 pub fn fetch(app: *App, browser: *Browser, url: [:0]const u8, opts: FetchOpts) !void {
@@ -147,6 +149,10 @@ pub fn fetch(app: *App, browser: *Browser, url: [:0]const u8, opts: FetchOpts) !
         const remaining = opts.wait_ms -| elapsed;
         if (remaining == 0) return error.Timeout;
         try runner.waitForScript(script, remaining);
+    }
+
+    if (opts.make_png) |path| {
+        try render.writePngFile(app.allocator, frame, path, .{});
     }
 
     const writer = opts.writer orelse return;

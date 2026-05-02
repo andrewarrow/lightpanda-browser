@@ -150,6 +150,7 @@ const Commands = cli.Builder(.{
         .positional = .{ .name = "url", .type = ?[:0]const u8 },
         .options = .{
             .{ .name = "dump", .type = ?DumpFormat, .validator = dumpValidator },
+            .{ .name = "make_png", .type = ?[]const u8 },
             .{ .name = "with_base", .type = bool },
             .{ .name = "with_frames", .type = bool },
             .{ .name = "strip_mode", .type = dump.Opts.Strip, .default = dump.Opts.Strip{} },
@@ -610,6 +611,9 @@ pub fn printUsageAndExit(self: *const Config, success: bool) void {
         \\--dump          Dumps document to stdout.
         \\                Argument must be 'html', 'markdown', 'semantic_tree', or 'semantic_tree_text'.
         \\                Defaults to no dump.
+        \\
+        \\--make-png      Write a PNG screenshot preview to the specified path
+        \\                using Lightpanda's native DOM/CSS state.
         \\
         \\--strip-mode    Comma separated list of tag groups to remove from dump
         \\                the dump. e.g. --strip-mode js,css
