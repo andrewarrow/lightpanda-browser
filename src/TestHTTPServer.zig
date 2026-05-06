@@ -143,6 +143,18 @@ fn getContentType(file_path: []const u8) []const u8 {
         return "text/html";
     }
 
+    if (std.mem.endsWith(u8, file_path, ".css")) {
+        return "text/css";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".svg")) {
+        return "image/svg+xml";
+    }
+
+    if (std.mem.endsWith(u8, file_path, ".png")) {
+        return "image/png";
+    }
+
     if (std.mem.endsWith(u8, file_path, ".xml")) {
         // some wpt tests do this
         return "text/xml";

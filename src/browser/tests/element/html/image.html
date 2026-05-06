@@ -31,20 +31,20 @@
     testing.expectEqual('', img.alt);
     testing.expectEqual('', img.currentSrc);
 
-    img.src = 'test.png';
+    img.src = '../../fixtures/image.svg';
     // src property returns resolved absolute URL
-    testing.expectEqual(testing.BASE_URL + 'element/html/test.png', img.src);
-    testing.expectEqual(testing.BASE_URL + 'element/html/test.png', img.currentSrc);
+    testing.expectEqual(testing.BASE_URL + 'fixtures/image.svg', img.src);
+    testing.expectEqual(testing.BASE_URL + 'fixtures/image.svg', img.currentSrc);
     // getAttribute returns the raw attribute value
-    testing.expectEqual('test.png', img.getAttribute('src'));
+    testing.expectEqual('../../fixtures/image.svg', img.getAttribute('src'));
 
-    img.src = '/absolute/path.png';
-    testing.expectEqual(testing.ORIGIN + '/absolute/path.png', img.src);
-    testing.expectEqual('/absolute/path.png', img.getAttribute('src'));
+    img.src = '/src/browser/tests/fixtures/image.svg';
+    testing.expectEqual(testing.BASE_URL + 'fixtures/image.svg', img.src);
+    testing.expectEqual('/src/browser/tests/fixtures/image.svg', img.getAttribute('src'));
 
-    img.src = 'https://example.com/image.png';
-    testing.expectEqual('https://example.com/image.png', img.src);
-    testing.expectEqual('https://example.com/image.png', img.getAttribute('src'));
+    img.src = testing.BASE_URL + 'fixtures/image.svg';
+    testing.expectEqual(testing.BASE_URL + 'fixtures/image.svg', img.src);
+    testing.expectEqual(testing.BASE_URL + 'fixtures/image.svg', img.getAttribute('src'));
 
     img.alt = 'Test image';
     testing.expectEqual('Test image', img.alt);
@@ -106,9 +106,10 @@
     const img = document.createElement('img');
     testing.expectEqual(true, img.complete);
 
-    // Image with src is also complete (headless browser, no actual fetch)
-    img.src = 'test.png';
-    testing.expectEqual(true, img.complete);
+    // Image with src becomes complete after its request finishes
+    img.src = testing.BASE_URL + 'fixtures/image.svg';
+    testing.expectEqual(true, img.complete === true || img.complete === false);
+    testing.onload(() => testing.expectEqual(true, img.complete));
 
     // Image constructor also complete
     const img2 = new Image();
@@ -135,7 +136,7 @@
         result = true;
         return resolve();
       });
-      img.src = "https://cdn.lightpanda.io/website/assets/images/docs/hn.png";
+      img.src = testing.BASE_URL + "fixtures/image.svg";
     });
   });
 
@@ -161,7 +162,7 @@
   let result = false;
   img.onload = () => result = true;
   document.body.appendChild(img);
-  img.src = "https://cdn.lightpanda.io/website/assets/images/docs/hn.png";
+  img.src = testing.BASE_URL + "fixtures/image.svg";
 
   testing.onload(() => testing.expectEqual(true, result));
 }

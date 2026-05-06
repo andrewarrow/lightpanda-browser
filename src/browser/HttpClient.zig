@@ -883,6 +883,8 @@ pub const RequestParams = struct {
         xhr,
         script,
         fetch,
+        stylesheet,
+        image,
 
         // Allowed Values: Document, Stylesheet, Image, Media, Font, Script,
         // TextTrack, XHR, Fetch, Prefetch, EventSource, WebSocket, Manifest,
@@ -894,6 +896,8 @@ pub const RequestParams = struct {
                 .xhr => "XHR",
                 .script => "Script",
                 .fetch => "Fetch",
+                .stylesheet => "Stylesheet",
+                .image => "Image",
             };
         }
     };

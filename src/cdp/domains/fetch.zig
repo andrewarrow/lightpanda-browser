@@ -208,12 +208,7 @@ pub fn requestIntercept(bc: *CDP.BrowserContext, intercept: *const Notification.
         .requestId = &id.toInterceptId(request.params.request_id),
         .frameId = &id.toFrameId(request.params.frame_id),
         .request = network.RequestWriter.init(request),
-        .resourceType = switch (request.params.resource_type) {
-            .script => "Script",
-            .xhr => "XHR",
-            .document => "Document",
-            .fetch => "Fetch",
-        },
+        .resourceType = request.params.resource_type.string(),
         .networkId = &id.toRequestId(request), // matches the Network REQ-ID
     }, .{ .session_id = session_id });
 
@@ -434,12 +429,7 @@ pub fn requestAuthRequired(bc: *CDP.BrowserContext, intercept: *const Notificati
         .requestId = &id.toInterceptId(request.params.request_id),
         .frameId = &id.toFrameId(request.params.frame_id),
         .request = network.RequestWriter.init(&request),
-        .resourceType = switch (request.params.resource_type) {
-            .script => "Script",
-            .xhr => "XHR",
-            .document => "Document",
-            .fetch => "Fetch",
-        },
+        .resourceType = request.params.resource_type.string(),
         .authChallenge = .{
             .origin = "", // TODO get origin, could be the proxy address for example.
             .source = if (challenge.source) |s| (if (s == .server) "Server" else "Proxy") else "",

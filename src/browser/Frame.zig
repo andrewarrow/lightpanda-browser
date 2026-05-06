@@ -878,6 +878,31 @@ pub fn iframeCompletedLoading(self: *Frame, iframe: *IFrame) void {
     self.pendingLoadCompleted();
 }
 
+pub fn subresourceStartedLoading(self: *Frame) bool {
+    if (self._load_state == .complete or self.isGoingAway()) {
+        return false;
+    }
+
+    self._pending_loads += 1;
+    return true;
+}
+
+pub fn subresourceCompletedLoading(self: *Frame, html_element: *HtmlElement, counted_for_load: bool) void {
+    self.queueOrDispatchLoad(html_element) catch |err| {
+        log.warn(.frame, "subresource load event", .{ .err = err, .type = self._type, .url = self.url });
+    };
+
+    if (counted_for_load) {
+        self.pendingLoadCompleted();
+    }
+}
+
+pub fn subresourceFailedLoading(self: *Frame, counted_for_load: bool) void {
+    if (counted_for_load) {
+        self.pendingLoadCompleted();
+    }
+}
+
 fn pendingLoadCompleted(self: *Frame) void {
     const pending_loads = self._pending_loads;
     if (pending_loads == 1) {
@@ -1614,6 +1639,25 @@ pub fn dispatchLoad(self: *Frame) !void {
     }
 
     to_process.clearRetainingCapacity();
+}
+
+pub fn queueOrDispatchLoad(self: *Frame, html_element: *HtmlElement) !void {
+    if (self._load_state != .complete) {
+        try self._to_load.append(self.arena, html_element);
+        return;
+    }
+
+    if (self._event_manager.has_dom_load_listener or html_element.hasAttributeFunction(.onload, self)) {
+        var ls: JS.Local.Scope = undefined;
+        self.js.localScope(&ls);
+        defer ls.deinit();
+
+        const entered = self.js.enter(&ls.handle_scope);
+        defer entered.exit();
+
+        const event = try Event.initTrusted(comptime .wrap("load"), .{}, self._page);
+        try self._event_manager.dispatch(html_element.asEventTarget(), event);
+    }
 }
 
 pub fn scheduleMutationDelivery(self: *Frame) !void {
@@ -2915,6 +2959,15 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
                 }
                 style._sheet = null;
             }
+            self._style_manager.sheetModified();
+        } else if (el.is(Element.Html.Link)) |link| {
+            if (link._sheet) |sheet| {
+                if (self.document._style_sheets) |sheets| {
+                    sheets.remove(sheet);
+                }
+                link._sheet = null;
+            }
+            link._loading_url = null;
             self._style_manager.sheetModified();
         }
     }

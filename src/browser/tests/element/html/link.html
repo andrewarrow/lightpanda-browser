@@ -25,7 +25,7 @@
   // A link with rel=stylesheet and a non-empty href fires a load event when appended to the DOM
   const link = document.createElement('link');
   link.rel = 'stylesheet';
-  link.href = 'https://lightpanda.io/opensource-browser/15';
+  link.href = testing.BASE_URL + 'fixtures/external.css';
 
   testing.async(async () => {
     const result = await new Promise(resolve => {
@@ -63,7 +63,7 @@
   // A link without rel=stylesheet should not fire a load event
   let fired = false;
   const link = document.createElement('link');
-  link.href = 'https://lightpanda.io/opensource-browser/15';
+  link.href = testing.BASE_URL + 'fixtures/external.css';
   link.addEventListener('load', () => { fired = true; });
   document.head.appendChild(link);
   testing.onload(() => testing.expectEqual(false, fired));
@@ -79,9 +79,33 @@
   // Append to DOM,
   document.head.appendChild(link);
   // then set href.
-  link.href = 'https://lightpanda.io/opensource-browser/15';
+  link.href = testing.BASE_URL + 'fixtures/external.css';
 
   testing.onload(() => testing.expectEqual(true, result));
+}
+</script>
+
+<script id="external-stylesheet-fetch">
+{
+  const target = document.createElement('div');
+  target.id = 'external-css-target';
+  (document.body || document.documentElement).appendChild(target);
+
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = testing.BASE_URL + 'fixtures/external.css';
+
+  let loaded = false;
+  link.onload = () => loaded = true;
+  document.head.appendChild(link);
+
+  testing.onload(() => {
+    testing.expectEqual(true, loaded);
+    testing.expectEqual(true, link.sheet instanceof CSSStyleSheet);
+    testing.expectEqual(testing.BASE_URL + 'fixtures/external.css', link.sheet.href);
+    testing.expectEqual(2, link.sheet.cssRules.length);
+    testing.expectEqual(false, target.checkVisibility());
+  });
 }
 </script>
 
@@ -92,7 +116,7 @@
   rels.forEach((rel, i) => {
     let link = document.createElement('link')
     link.rel = rel;
-    link.href = '/nope';
+    link.href = rel === 'stylesheet' ? testing.BASE_URL + 'fixtures/external.css' : '/nope';
     link.onload = () => results[i] = true;
     document.documentElement.appendChild(link);
   });
