@@ -38,6 +38,8 @@ pub const Options = struct {
 const Pass = enum { measure, paint };
 
 const Display = enum { block, flex, grid, none };
+const AlignItems = enum { start, center, end };
+const JustifyContent = enum { start, center, end };
 
 const Edges = struct {
     top: i32 = 0,
@@ -154,6 +156,9 @@ const ElementStyle = struct {
     font_scale: u8,
     display: Display,
     flex_column: bool,
+    align_items: AlignItems,
+    justify_content: JustifyContent,
+    nowrap: bool,
     center_auto: bool,
     gap: i32,
 };
@@ -183,7 +188,7 @@ const Renderer = struct {
         }
 
         const width: i32 = @intCast(self.image.width);
-        _ = try self.layoutElement(.paint, root, 0, 0, width, .black, 0);
+        _ = try self.layoutElement(.paint, root, 0, 0, width, .black, 2, 0);
     }
 
     fn renderRoot(self: *Renderer) ?*Element {
@@ -234,12 +239,13 @@ const Renderer = struct {
         y: i32,
         max_width_: i32,
         inherited_color: Rgba,
+        inherited_font_scale: u8,
         depth: u16,
     ) !i32 {
         if (depth > 256 or !self.isRenderable(el)) return 0;
 
         const max_width = @max(1, max_width_);
-        const style = try self.elementStyle(el, max_width, inherited_color);
+        const style = try self.elementStyle(el, max_width, inherited_color, inherited_font_scale);
         if (style.display == .none) return 0;
 
         const outer_width = @max(1, @min(style.width, max_width - style.margin.horizontal()));
@@ -252,7 +258,7 @@ const Renderer = struct {
         var cursor_y = outer_y + style.padding.top;
 
         const measured_total_for_paint = if (pass == .paint) blk: {
-            const measured = try self.layoutElement(.measure, el, x, y, max_width_, inherited_color, depth);
+            const measured = try self.layoutElement(.measure, el, x, y, max_width_, inherited_color, inherited_font_scale, depth);
             const measured_content_height = @max(0, measured - style.margin.vertical());
             if (style.background) |bg| {
                 self.image.fillRect(outer_x, outer_y, outer_width, measured_content_height, bg);
@@ -261,43 +267,93 @@ const Renderer = struct {
             break :blk measured;
         } else null;
 
-        var intrinsic_height = self.intrinsicHeight(el, style.font_scale);
+        var intrinsic_height = if (style.explicit_height == null) self.intrinsicHeight(el, style.font_scale) else 0;
         const row_children = self.rowChildCount(el, style);
         if (row_children > 1) {
             const gap_total = style.gap * @as(i32, @intCast(row_children - 1));
-            var flex_widths: [64]i32 = undefined;
-            var flex_width_count: usize = 0;
+            var child_widths: [64]i32 = undefined;
+            var child_width_count: usize = 0;
             if (style.display == .flex) {
                 var width_child = el.asNode().firstChild();
                 while (width_child) |node| {
                     switch (node._type) {
+                        .cdata => |cd| {
+                            if (cd.is(CData.Text)) |_| {
+                                const text = cd.getData().str();
+                                if (isRenderableText(text) and child_width_count < child_widths.len) {
+                                    child_widths[child_width_count] = @max(1, textInlineWidth(text, style.font_scale));
+                                    child_width_count += 1;
+                                }
+                            }
+                        },
                         .element => |child_el| {
-                            if (self.isRenderable(child_el) and flex_width_count < flex_widths.len) {
-                                flex_widths[flex_width_count] = try self.preferredFlexChildWidth(child_el, @max(1, inner_width - gap_total), style.color);
-                                flex_width_count += 1;
+                            if (self.isRenderable(child_el) and child_width_count < child_widths.len) {
+                                child_widths[child_width_count] = try self.preferredChildWidth(child_el, @max(1, inner_width - gap_total), style.color, style.font_scale);
+                                child_width_count += 1;
                             }
                         },
                         else => {},
                     }
                     width_child = node.nextSibling();
                 }
+            } else if (style.display == .grid) {
+                child_width_count = try self.gridChildWidths(el, inner_width, gap_total, row_children, style, &child_widths);
             }
 
             const grid_child_width = @max(1, @divTrunc(@max(1, inner_width - gap_total), @as(i32, @intCast(row_children))));
-            var cursor_x = inner_x;
+            const used_width = childWidthsTotal(child_widths[0..child_width_count], style.gap);
+            const free_width = @max(0, inner_width - used_width);
+            var cursor_x = inner_x + switch (style.justify_content) {
+                .start => 0,
+                .center => @divTrunc(free_width, 2),
+                .end => free_width,
+            };
             var max_child_height: i32 = 0;
+            var row_target_height: i32 = 0;
             var child_index: usize = 0;
 
             var child = el.asNode().firstChild();
             while (child) |node| {
                 switch (node._type) {
+                    .cdata => |cd| {
+                        if (style.display == .flex and cd.is(CData.Text) != null) {
+                            const text = cd.getData().str();
+                            if (isRenderableText(text)) {
+                                const child_width = if (child_index < child_width_count)
+                                    @min(child_widths[child_index], @max(1, inner_x + inner_width - cursor_x))
+                                else
+                                    textInlineWidth(text, style.font_scale);
+                                const measured_child_height = lineHeight(style.font_scale);
+                                max_child_height = @max(max_child_height, measured_child_height);
+                                const min_content_height = @max(style.explicit_height orelse 0, style.min_height) - style.padding.vertical();
+                                row_target_height = @max(max_child_height, min_content_height);
+                                const child_y = cursor_y + switch (style.align_items) {
+                                    .start => 0,
+                                    .center => @divTrunc(@max(0, row_target_height - measured_child_height), 2),
+                                    .end => @max(0, row_target_height - measured_child_height),
+                                };
+                                _ = self.layoutText(pass, text, cursor_x, child_y, child_width, style.color, style.font_scale, style.nowrap);
+                                cursor_x += child_width + style.gap;
+                                child_index += 1;
+                            }
+                        }
+                    },
                     .element => |child_el| {
                         if (self.isRenderable(child_el)) {
-                            const child_width = if (style.display == .flex and child_index < flex_width_count)
-                                @min(flex_widths[child_index], @max(1, inner_x + inner_width - cursor_x))
+                            const child_width = if (child_index < child_width_count)
+                                @min(child_widths[child_index], @max(1, inner_x + inner_width - cursor_x))
                             else
                                 grid_child_width;
-                            const h = try self.layoutElement(pass, child_el, cursor_x, cursor_y, child_width, style.color, depth + 1);
+                            const measured_child_height = try self.layoutElement(.measure, child_el, cursor_x, cursor_y, child_width, style.color, style.font_scale, depth + 1);
+                            max_child_height = @max(max_child_height, measured_child_height);
+                            const min_content_height = @max(style.explicit_height orelse 0, style.min_height) - style.padding.vertical();
+                            row_target_height = @max(max_child_height, min_content_height);
+                            const child_y = cursor_y + switch (style.align_items) {
+                                .start => 0,
+                                .center => @divTrunc(@max(0, row_target_height - measured_child_height), 2),
+                                .end => @max(0, row_target_height - measured_child_height),
+                            };
+                            const h = try self.layoutElement(pass, child_el, cursor_x, child_y, child_width, style.color, style.font_scale, depth + 1);
                             max_child_height = @max(max_child_height, h);
                             cursor_x += child_width + style.gap;
                             child_index += 1;
@@ -307,19 +363,19 @@ const Renderer = struct {
                 }
                 child = node.nextSibling();
             }
-            cursor_y += max_child_height;
+            cursor_y += @max(max_child_height, row_target_height);
         } else {
             var child = el.asNode().firstChild();
             while (child) |node| {
                 switch (node._type) {
                     .cdata => |cd| {
                         if (cd.is(CData.Text)) |_| {
-                            const h = self.layoutText(pass, cd.getData().str(), inner_x, cursor_y, inner_width, style.color, style.font_scale);
+                            const h = self.layoutText(pass, cd.getData().str(), inner_x, cursor_y, inner_width, style.color, style.font_scale, style.nowrap);
                             cursor_y += h;
                         }
                     },
                     .element => |child_el| {
-                        const h = try self.layoutElement(pass, child_el, inner_x, cursor_y, inner_width, style.color, depth + 1);
+                        const h = try self.layoutElement(pass, child_el, inner_x, cursor_y, inner_width, style.color, style.font_scale, depth + 1);
                         cursor_y += h;
                     },
                     else => {},
@@ -333,10 +389,7 @@ const Renderer = struct {
         }
 
         var content_height = cursor_y - outer_y + style.padding.bottom;
-        content_height = @max(content_height, intrinsic_height);
-        if (style.explicit_height) |h| {
-            content_height = @max(content_height, h);
-        }
+        content_height = if (style.explicit_height) |h| @max(content_height, h) else @max(content_height, intrinsic_height);
         content_height = @max(content_height, style.min_height);
         const total_height = content_height + style.margin.vertical();
 
@@ -347,18 +400,18 @@ const Renderer = struct {
         return @max(0, total_height);
     }
 
-    fn elementStyle(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba) !ElementStyle {
+    fn elementStyle(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba, inherited_font_scale: u8) !ElementStyle {
         const tag = el.getTag();
-        const inherited_font_scale = defaultFontScale(tag);
-        const margin = self.resolveEdges(el, "margin", defaultMargin(tag), max_width, inherited_font_scale);
-        const padding = self.resolveEdges(el, "padding", defaultPadding(tag), max_width, inherited_font_scale);
+        const base_font_scale = defaultFontScale(tag) orelse inherited_font_scale;
+        const font_scale = self.resolveFontScale(el, base_font_scale) orelse base_font_scale;
+        const margin = self.resolveEdges(el, "margin", defaultMargin(tag), max_width, font_scale);
+        const padding = self.resolveEdges(el, "padding", defaultPadding(tag), max_width, font_scale);
         const available_width = @max(1, max_width - margin.horizontal());
-        const explicit_width = self.resolveLength(el, "width", available_width, inherited_font_scale) orelse self.attributeLength(el, "width", available_width);
-        const explicit_height = self.resolveLength(el, "height", available_width, inherited_font_scale) orelse self.attributeLength(el, "height", available_width);
-        const min_height = self.resolveLength(el, "min-height", available_width, inherited_font_scale) orelse 0;
+        const explicit_width = self.resolveLength(el, "width", available_width, font_scale) orelse self.attributeLength(el, "width", available_width);
+        const explicit_height = self.resolveLength(el, "height", available_width, font_scale) orelse self.attributeLength(el, "height", available_width);
+        const min_height = self.resolveLength(el, "min-height", available_width, font_scale) orelse 0;
         const width = explicit_width orelse defaultWidth(tag, available_width);
         const color_value = self.resolveColor(el, "color") orelse inherited_color;
-        const font_scale = self.resolveFontScale(el, inherited_font_scale) orelse inherited_font_scale;
 
         return .{
             .margin = margin,
@@ -371,6 +424,9 @@ const Renderer = struct {
             .font_scale = font_scale,
             .display = self.resolveDisplay(el),
             .flex_column = self.hasCssValue(el, "flex-direction", "column"),
+            .align_items = self.resolveAlignItems(el),
+            .justify_content = self.resolveJustifyContent(el),
+            .nowrap = self.hasCssValue(el, "white-space", "nowrap"),
             .center_auto = self.hasAutoHorizontalMargin(el),
             .gap = self.resolveLength(el, "gap", available_width, font_scale) orelse 0,
         };
@@ -405,6 +461,10 @@ const Renderer = struct {
         switch (el.getTag()) {
             .hr => self.image.fillRect(x, y + @divTrunc(h, 2), w, 1, .light_border),
             .img, .iframe, .embed, .object, .video, .canvas => {
+                if (el.getTag() == .img and w <= 48 and h <= 48) {
+                    self.paintSmallImagePlaceholder(el, x, y, w, h);
+                    return;
+                }
                 self.image.fillRect(x, y, w, h, .surface);
                 self.image.strokeRect(x, y, w, h, .light_border);
                 const label = switch (el.getTag()) {
@@ -414,26 +474,26 @@ const Renderer = struct {
                     .canvas => "canvas",
                     else => "media",
                 };
-                _ = self.layoutText(.paint, label, x + 8, y + 8, @max(1, w - 16), .muted, 1);
+                _ = self.layoutText(.paint, label, x + 8, y + 8, @max(1, w - 16), .muted, 1, false);
             },
             .input, .select, .textarea, .button => {
                 self.image.fillRect(x, y, w, h, .{ .r = 250, .g = 252, .b = 255 });
                 self.image.strokeRect(x, y, w, h, .light_border);
                 if (el.getAttributeSafe(comptime .wrap("value")) orelse el.getAttributeSafe(comptime .wrap("placeholder"))) |label| {
-                    _ = self.layoutText(.paint, label, x + 8, y + 10, @max(1, w - 16), style.color, 1);
+                    _ = self.layoutText(.paint, label, x + 8, y + 10, @max(1, w - 16), style.color, 1, false);
                 } else {
                     const text = el.asNode().getTextContentAlloc(self.css_allocator) catch null;
-                    _ = self.layoutText(.paint, text orelse "", x + 8, y + 10, @max(1, w - 16), style.color, 1);
+                    _ = self.layoutText(.paint, text orelse "", x + 8, y + 10, @max(1, w - 16), style.color, 1, false);
                 }
             },
             else => {},
         }
     }
 
-    fn layoutText(self: *Renderer, pass: Pass, text: []const u8, x: i32, y: i32, max_width: i32, c: Rgba, scale: u8) i32 {
+    fn layoutText(self: *Renderer, pass: Pass, text: []const u8, x: i32, y: i32, max_width: i32, c: Rgba, scale: u8, nowrap: bool) i32 {
         if (text.len == 0 or max_width <= 0) return 0;
 
-        const glyph_advance: i32 = @as(i32, scale) * 6;
+        const glyph_advance = glyphAdvance(scale);
         const glyph_width: i32 = @as(i32, scale) * 5;
         const lh = lineHeight(scale);
         var cursor_x = x;
@@ -445,7 +505,7 @@ const Renderer = struct {
             const word_width = @as(i32, @intCast(word.len)) * glyph_advance;
             const needs_space = cursor_x > x;
             const space_width = if (needs_space) glyph_advance else 0;
-            if (needs_space and cursor_x + space_width + word_width > x + max_width) {
+            if (!nowrap and needs_space and cursor_x + space_width + word_width > x + max_width) {
                 cursor_x = x;
                 cursor_y += lh;
             } else if (needs_space) {
@@ -453,7 +513,8 @@ const Renderer = struct {
             }
 
             for (word) |raw| {
-                if (cursor_x + glyph_width > x + max_width) {
+                if (nowrap and cursor_x + glyph_width > x + max_width) break;
+                if (!nowrap and cursor_x + glyph_width > x + max_width) {
                     cursor_x = x;
                     cursor_y += lh;
                 }
@@ -502,6 +563,11 @@ const Renderer = struct {
         var child = el.asNode().firstChild();
         while (child) |node| {
             switch (node._type) {
+                .cdata => |cd| {
+                    if (style.display == .flex and cd.is(CData.Text) != null and isRenderableText(cd.getData().str())) {
+                        count += 1;
+                    }
+                },
                 .element => |child_el| {
                     if (self.isRenderable(child_el)) count += 1;
                 },
@@ -512,19 +578,163 @@ const Renderer = struct {
         return count;
     }
 
-    fn preferredFlexChildWidth(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba) !i32 {
+    fn preferredChildWidth(self: *Renderer, el: *Element, max_width: i32, inherited_color: Rgba, inherited_font_scale: u8) !i32 {
         const tag = el.getTag();
-        const font_scale = self.resolveFontScale(el, defaultFontScale(tag)) orelse defaultFontScale(tag);
+        const base_font_scale = defaultFontScale(tag) orelse inherited_font_scale;
+        const font_scale = self.resolveFontScale(el, base_font_scale) orelse base_font_scale;
         const explicit_width = self.resolveLength(el, "width", max_width, font_scale) orelse self.attributeLength(el, "width", max_width);
         if (explicit_width) |w| return @max(1, @min(max_width, w));
 
-        const child_style = try self.elementStyle(el, max_width, inherited_color);
+        const child_style = try self.elementStyle(el, max_width, inherited_color, inherited_font_scale);
+        if (child_style.display == .flex and !child_style.flex_column) {
+            var total: i32 = 0;
+            var count: usize = 0;
+            var child = el.asNode().firstChild();
+            while (child) |node| {
+                switch (node._type) {
+                    .cdata => |cd| {
+                        if (cd.is(CData.Text) != null) {
+                            const text = cd.getData().str();
+                            if (isRenderableText(text)) {
+                                total += textInlineWidth(text, child_style.font_scale);
+                                count += 1;
+                            }
+                        }
+                    },
+                    .element => |child_el| {
+                        if (self.isRenderable(child_el)) {
+                            total += try self.preferredChildWidth(child_el, max_width, child_style.color, child_style.font_scale);
+                            count += 1;
+                        }
+                    },
+                    else => {},
+                }
+                child = node.nextSibling();
+            }
+            if (count > 0) {
+                total += child_style.gap * @as(i32, @intCast(count - 1));
+                total += child_style.padding.horizontal();
+                return @max(1, @min(max_width, total));
+            }
+        }
         const text = el.asNode().getTextContentAlloc(self.css_allocator) catch "";
         const text_width = textInlineWidth(text, child_style.font_scale) + child_style.padding.horizontal();
         if (text_width > child_style.padding.horizontal()) {
             return @max(1, @min(max_width, text_width));
         }
         return @max(1, @min(max_width, child_style.width));
+    }
+
+    fn gridChildWidths(
+        self: *Renderer,
+        el: *Element,
+        inner_width: i32,
+        gap_total: i32,
+        child_count: usize,
+        style: ElementStyle,
+        out: *[64]i32,
+    ) !usize {
+        const columns = self.propertyValue(el, "grid-template-columns") orelse return 0;
+        const available = @max(1, inner_width - gap_total);
+        if (std.ascii.indexOfIgnoreCase(columns, "repeat(") != null) {
+            const each = @max(1, @divTrunc(available, @as(i32, @intCast(child_count))));
+            for (0..@min(child_count, out.len)) |i| out[i] = each;
+            return @min(child_count, out.len);
+        }
+
+        var parts: [64][]const u8 = undefined;
+        const track_count = @min(splitCssComponents(stripImportant(columns), &parts), child_count);
+        if (track_count == 0) return 0;
+
+        var mins: [64]i32 = .{0} ** 64;
+        var frs: [64]f64 = .{0} ** 64;
+        var fixed_sum: i32 = 0;
+        var fr_sum: f64 = 0;
+
+        var i: usize = 0;
+        while (i < track_count) : (i += 1) {
+            const parsed = self.parseGridTrack(parts[i], available, style.font_scale);
+            mins[i] = if (parsed.auto_width) blk: {
+                const child = self.nthRenderableChild(el, i) orelse break :blk parsed.min_width;
+                break :blk @max(parsed.min_width, try self.preferredChildWidth(child, available, style.color, style.font_scale));
+            } else parsed.min_width;
+            frs[i] = parsed.fr;
+            fixed_sum += mins[i];
+            fr_sum += parsed.fr;
+        }
+
+        const remaining = @max(0, available - fixed_sum);
+        i = 0;
+        while (i < track_count) : (i += 1) {
+            const extra: i32 = if (fr_sum > 0 and frs[i] > 0)
+                @intFromFloat(@round(@as(f64, @floatFromInt(remaining)) * frs[i] / fr_sum))
+            else
+                0;
+            out[i] = @max(1, mins[i] + extra);
+        }
+        return track_count;
+    }
+
+    fn nthRenderableChild(self: *Renderer, el: *Element, target: usize) ?*Element {
+        var index: usize = 0;
+        var child = el.asNode().firstChild();
+        while (child) |node| {
+            switch (node._type) {
+                .element => |child_el| {
+                    if (self.isRenderable(child_el)) {
+                        if (index == target) return child_el;
+                        index += 1;
+                    }
+                },
+                else => {},
+            }
+            child = node.nextSibling();
+        }
+        return null;
+    }
+
+    const GridTrack = struct {
+        min_width: i32 = 0,
+        fr: f64 = 0,
+        auto_width: bool = false,
+    };
+
+    fn parseGridTrack(self: *Renderer, value_: []const u8, available: i32, font_scale: u8) GridTrack {
+        const value = std.mem.trim(u8, value_, " \t\r\n;");
+        if (std.ascii.eqlIgnoreCase(value, "auto")) return .{ .auto_width = true };
+        if (parseFr(value)) |fr| return .{ .fr = fr };
+
+        if (stripFunction(value, "minmax")) |inner| {
+            var args: [2][]const u8 = undefined;
+            if (splitCssArgs(inner, &args) == 2) {
+                const min_width = parseLength(args[0], available, @intCast(self.image.width), @intCast(self.image.height), font_scale) orelse 0;
+                if (std.ascii.eqlIgnoreCase(args[1], "auto")) return .{ .min_width = min_width, .auto_width = true };
+                return .{ .min_width = min_width, .fr = parseFr(args[1]) orelse 0 };
+            }
+        }
+
+        return .{
+            .min_width = parseLength(value, available, @intCast(self.image.width), @intCast(self.image.height), font_scale) orelse 0,
+        };
+    }
+
+    fn paintSmallImagePlaceholder(self: *Renderer, el: *Element, x: i32, y: i32, w: i32, h: i32) void {
+        if (w <= 0 or h <= 0) return;
+        const src = el.getAttributeSafe(comptime .wrap("src")) orelse "";
+        const bg = colorFromHash(hashBytes(src));
+        self.image.fillRect(x, y, w, h, bg);
+
+        const letter = imagePlaceholderLetter(src);
+        const glyph_scale: u8 = if (@min(w, h) >= 20) 2 else 1;
+        const glyph_w = @as(i32, glyph_scale) * 5;
+        const glyph_h = @as(i32, glyph_scale) * 7;
+        self.drawGlyph(
+            x + @divTrunc(@max(0, w - glyph_w), 2),
+            y + @divTrunc(@max(0, h - glyph_h), 2),
+            letter,
+            .white,
+            glyph_scale,
+        );
     }
 
     fn resolveLength(self: *Renderer, el: *Element, property: []const u8, percent_base: i32, font_scale: u8) ?i32 {
@@ -555,7 +765,7 @@ const Renderer = struct {
     fn resolveFontScale(self: *Renderer, el: *Element, inherited_scale: u8) ?u8 {
         const value = self.propertyValue(el, "font-size") orelse return null;
         const px = parseLength(value, @intCast(self.image.width), @intCast(self.image.width), @intCast(self.image.height), inherited_scale) orelse return null;
-        const scale = std.math.clamp(@divTrunc(px + 5, 11), 1, 10);
+        const scale = std.math.clamp(@divTrunc(px + 3, 7), 1, 12);
         return @intCast(scale);
     }
 
@@ -579,6 +789,20 @@ const Renderer = struct {
         if (containsCssIdent(value, "flex") or containsCssIdent(value, "inline-flex")) return .flex;
         if (containsCssIdent(value, "grid") or containsCssIdent(value, "inline-grid")) return .grid;
         return .block;
+    }
+
+    fn resolveAlignItems(self: *Renderer, el: *Element) AlignItems {
+        const value = self.propertyValue(el, "align-items") orelse return .start;
+        if (containsCssIdent(value, "center")) return .center;
+        if (containsCssIdent(value, "end") or containsCssIdent(value, "flex-end")) return .end;
+        return .start;
+    }
+
+    fn resolveJustifyContent(self: *Renderer, el: *Element) JustifyContent {
+        const value = self.propertyValue(el, "justify-content") orelse return .start;
+        if (containsCssIdent(value, "center")) return .center;
+        if (containsCssIdent(value, "end") or containsCssIdent(value, "flex-end")) return .end;
+        return .start;
     }
 
     fn hasCssValue(self: *Renderer, el: *Element, property: []const u8, needle: []const u8) bool {
@@ -723,20 +947,20 @@ fn defaultWidth(tag: Element.Tag, max_width: i32) i32 {
     };
 }
 
-fn defaultFontScale(tag: Element.Tag) u8 {
+fn defaultFontScale(tag: Element.Tag) ?u8 {
     return switch (tag) {
         .h1 => 6,
         .h2, .h3 => 4,
-        else => 2,
+        else => null,
     };
 }
 
 fn lineHeight(scale: u8) i32 {
-    return @as(i32, scale) * 9 + 4;
+    return @as(i32, scale) * 8 + 2;
 }
 
 fn textInlineWidth(text: []const u8, scale: u8) i32 {
-    const glyph_advance: i32 = @as(i32, scale) * 6;
+    const glyph_advance = glyphAdvance(scale);
     var width: i32 = 0;
     var needs_space = false;
     var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
@@ -748,8 +972,88 @@ fn textInlineWidth(text: []const u8, scale: u8) i32 {
     return width;
 }
 
+fn isRenderableText(text: []const u8) bool {
+    for (text) |c| {
+        if (!std.ascii.isWhitespace(c)) return true;
+    }
+    return false;
+}
+
+fn glyphAdvance(scale: u8) i32 {
+    const s: i32 = @intCast(scale);
+    return s * 5 + @max(1, @divTrunc(s, 2));
+}
+
 fn fontScalePx(scale: u8) f64 {
-    return @as(f64, @floatFromInt(@max(@as(u8, 1), scale))) * 8.0;
+    return @as(f64, @floatFromInt(@max(@as(u8, 1), scale))) * 7.0;
+}
+
+fn childWidthsTotal(widths: []const i32, gap: i32) i32 {
+    if (widths.len == 0) return 0;
+    var total: i32 = gap * @as(i32, @intCast(widths.len - 1));
+    for (widths) |w| total += w;
+    return total;
+}
+
+fn parseFr(value_: []const u8) ?f64 {
+    const value = stripImportant(std.mem.trim(u8, value_, " \t\r\n;"));
+    if (!std.mem.endsWith(u8, value, "fr")) return null;
+    const n = std.mem.trim(u8, value[0 .. value.len - 2], " \t\r\n");
+    if (n.len == 0) return 1.0;
+    return std.fmt.parseFloat(f64, n) catch null;
+}
+
+fn hashBytes(bytes: []const u8) u32 {
+    var h: u32 = 2166136261;
+    for (bytes) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    return h;
+}
+
+fn colorFromHash(h: u32) Rgba {
+    const palette = [_]Rgba{
+        .{ .r = 78, .g = 221, .b = 209 },
+        .{ .r = 90, .g = 157, .b = 255 },
+        .{ .r = 255, .g = 182, .b = 94 },
+        .{ .r = 204, .g = 86, .b = 205 },
+        .{ .r = 255, .g = 92, .b = 112 },
+        .{ .r = 66, .g = 176, .b = 120 },
+        .{ .r = 120, .g = 132, .b = 255 },
+        .{ .r = 238, .g = 238, .b = 238 },
+    };
+    return palette[h % palette.len];
+}
+
+fn imagePlaceholderLetter(src: []const u8) u8 {
+    var last_dot: ?usize = null;
+    var end = src.len;
+    if (std.mem.indexOf(u8, src, "://")) |scheme| {
+        var host_start = scheme + 3;
+        while (host_start < src.len and src[host_start] == '/') : (host_start += 1) {}
+        end = std.mem.indexOfAnyPos(u8, src, host_start, "/?#") orelse src.len;
+        var i = host_start;
+        while (i < end) : (i += 1) {
+            if (src[i] == '.') last_dot = i;
+        }
+        if (last_dot) |dot| {
+            var start = dot;
+            while (start > host_start and src[start - 1] != '.') : (start -= 1) {}
+            if (start < dot) return src[start];
+        }
+        if (host_start < end) return src[host_start];
+    }
+
+    for (src, 0..) |c, i| {
+        if (c == '.') last_dot = i;
+    }
+    if (last_dot) |dot| {
+        var start = dot;
+        while (start > 0 and src[start - 1] != '/' and src[start - 1] != '.') : (start -= 1) {}
+        if (start < dot) return src[start];
+    }
+    return 'i';
 }
 
 fn stripImportant(value: []const u8) []const u8 {
