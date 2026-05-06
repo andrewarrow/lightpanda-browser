@@ -93,7 +93,7 @@ check-zig-version:
 ## Build v8 snapshot
 build-v8-snapshot: check-zig-version
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin)
+	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseSafe snapshot_creator -- src/snapshot.bin)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
