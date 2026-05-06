@@ -86,12 +86,34 @@ pub fn build(b: *Build) !void {
 
         try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path);
         try linkCurl(b, mod, enable_tsan);
-        try linkHtml5Ever(b, mod);
+        try linkHtml5Ever(b, mod, "html5ever");
 
         break :blk mod;
     };
 
     linkSqlite(b, lightpanda_module, enable_csan, enable_tsan);
+
+    const snapshot_lightpanda_module = blk: {
+        const mod = b.addModule("lightpanda_snapshot", .{
+            .root_source_file = b.path("src/lightpanda_snapshot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+            .sanitize_c = enable_csan,
+            .sanitize_thread = enable_tsan,
+        });
+        mod.addImport("lightpanda", mod); // allow circular "lightpanda" import
+        mod.addImport("build_config", opts.createModule());
+
+        try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path);
+        try linkCurl(b, mod, enable_tsan);
+        try linkHtml5Ever(b, mod, "html5ever-snapshot");
+
+        break :blk mod;
+    };
+
+    linkSqlite(b, snapshot_lightpanda_module, enable_csan, enable_tsan);
 
     // Check compilation
     const check = b.step("check", "Check if lightpanda compiles");
@@ -154,7 +176,7 @@ pub fn build(b: *Build) !void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "lightpanda", .module = lightpanda_module },
+                    .{ .name = "lightpanda", .module = snapshot_lightpanda_module },
                 },
             }),
         });
@@ -241,7 +263,7 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkHtml5Ever(b: *Build, mod: *Build.Module) !void {
+fn linkHtml5Ever(b: *Build, mod: *Build.Module, step_name: []const u8) !void {
     const is_debug = if (mod.optimize.? == .Debug) true else false;
 
     const exec_cargo = b.addSystemCommand(&.{
@@ -266,7 +288,7 @@ fn linkHtml5Ever(b: *Build, mod: *Build.Module) !void {
     // TODO: We can prefer `--artifact-dir` once it become stable.
     const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "html5ever");
 
-    const html5ever_step = b.step("html5ever", "Install html5ever dependency (requires cargo)");
+    const html5ever_step = b.step(step_name, "Install html5ever dependency (requires cargo)");
     html5ever_step.dependOn(&exec_cargo.step);
 
     const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblitefetch_html5ever.a");
