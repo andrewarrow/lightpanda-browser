@@ -4,7 +4,8 @@
 REQUIRED_ZIG_VERSION := $(shell sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)
 REQUIRED_ZIG_SERIES := $(shell printf '%s\n' '$(REQUIRED_ZIG_VERSION)' | cut -d. -f1,2)
 HOMEBREW_ZIG := $(shell if command -v brew >/dev/null 2>&1; then prefix=$$(brew --prefix zig@$(REQUIRED_ZIG_SERIES) 2>/dev/null); if [ -x "$$prefix/bin/zig" ]; then printf '%s/bin/zig' "$$prefix"; fi; fi)
-ZIG ?= $(if $(HOMEBREW_ZIG),$(HOMEBREW_ZIG),zig)
+PATH_ZIG := $(shell if command -v zig >/dev/null 2>&1 && [ "$$(zig version 2>/dev/null)" = "$(REQUIRED_ZIG_VERSION)" ]; then command -v zig; fi)
+ZIG ?= $(if $(PATH_ZIG),$(PATH_ZIG),$(if $(HOMEBREW_ZIG),$(HOMEBREW_ZIG),zig))
 BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
@@ -29,12 +30,6 @@ else ifeq ($(kernel), Linux x86_64)
 	ARCH := x86_64
 else
 	$(error "Unhandled kernel: $(kernel)")
-endif
-
-ifeq ($(OS), macos)
-# V8 hooks invoke `python3` directly. Prefer Apple's Python on macOS so a
-# broken Homebrew Python does not derail depot_tools during `gclient sync`.
-export PATH := /usr/bin:/bin:/usr/sbin:/sbin:$(PATH)
 endif
 
 define run_with_heartbeat
@@ -93,7 +88,7 @@ check-zig-version:
 ## Build v8 snapshot
 build-v8-snapshot: check-zig-version
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseSafe snapshot_creator -- src/snapshot.bin)
+	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
