@@ -10,6 +10,7 @@ BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
 BUILD_HEARTBEAT_SECONDS ?= 30
+SNAPSHOT_CREATOR_VERSION ?= 0.0.0+snapshot
 
 # OS and ARCH
 kernel = $(shell uname -ms)
@@ -88,7 +89,7 @@ check-zig-version:
 ## Build v8 snapshot
 build-v8-snapshot: check-zig-version
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin)
+	$(call run_with_heartbeat,$(ZIG) build -Doptimize=ReleaseFast -Dversion=$(SNAPSHOT_CREATOR_VERSION) snapshot_creator -- src/snapshot.bin)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
